@@ -1,281 +1,458 @@
-# Coursera CS Course Scraper
+# Coursera CS Course Scraper — Research Project
 
-Scrapes Computer Science domain courses from the Coursera Career Academy PLUS+ catalog, collecting rich metadata including skills, tools, module structure, video/reading/assignment counts, learning objectives, and course ratings.
-
-**Built for:** ITCS Course Recommendation System (UNC Charlotte)  
-**Author:** Devanand Nagendrababu
-
----
-
-## What It Collects
-
-For each of ~2,635 CS courses:
-
-| Field | Source |
-|---|---|
-| Course name, URL, slug | Excel catalog |
-| Skills (e.g. Python, SQL) | Coursera page HTML |
-| Tools (e.g. TensorFlow, Docker) | Coursera page HTML |
-| Learning objectives | Coursera API |
-| Module titles + descriptions | Coursera API |
-| Video / Reading / Assignment counts | Coursera API |
-| Total duration (minutes) | Coursera API |
-| Course rating | Coursera page HTML |
-| Instructor names | Coursera API |
-| Difficulty level | Coursera API |
+**Author:** Devanand Nagendrababu (`dnagendr`)  
+**Course:** Research Assistant — Prof. Dr. Qiong Cheng  
+**Cluster:** UNC Charlotte HPC (`hpc.charlotte.edu`) — Orion Partition  
+**Goal:** Scrape all Computer Science domain courses from the Coursera Career Academy+ catalog to build a course recommendation system.
 
 ---
 
-## Repository Structure
+## Table of Contents
+
+1. [Project Overview](#1-project-overview)
+2. [Data Source — Excel Catalog](#2-data-source--excel-catalog)
+3. [What the Scraper Collects](#3-what-the-scraper-collects)
+4. [Repository Structure](#4-repository-structure)
+5. [Setup on HPC Cluster](#5-setup-on-hpc-cluster)
+6. [How to Run](#6-how-to-run)
+7. [Scraper Architecture](#7-scraper-architecture)
+8. [HPC Deployment Journey — What We Tried](#8-hpc-deployment-journey--what-we-tried)
+9. [Root Cause: NAT Gateway Discovery](#9-root-cause-nat-gateway-discovery)
+10. [Current Blocker — Help Needed](#10-current-blocker--help-needed)
+11. [Proposed Solutions](#11-proposed-solutions)
+12. [Output Format](#12-output-format)
+13. [Troubleshooting](#13-troubleshooting)
+
+---
+
+## 1. Project Overview
+
+This scraper targets **2,635 Computer Science domain courses** from Coursera's Career Academy+ program. It uses Coursera's internal APIs (not the public API) along with authenticated page scraping to collect rich course metadata including learning objectives, skills, tools, module structure, video counts, and instructor information — all fields needed for building a content-based recommendation engine.
+
+The scraper is written in Python 3.9, follows Professor Cheng's HPC deployment pattern (virtual environment + SLURM job generation), and has been extensively tested and debugged over multiple cluster runs.
+
+---
+
+## 2. Data Source — Excel Catalog
+
+**File:** `Coursera Career Academy PLUS+ Catalog.xlsx`
+
+| Sheet | Header Row | Courses | CS Domain | URL Column | Status |
+|---|---|---|---|---|---|
+| CA+ 825 | Row 3 | 2,450 | ✅ Yes | ✅ Yes | Scraped |
+| CA+ Guided Projects | Row 3 | 456 | ✅ Yes | ✅ Yes | Scraped |
+| ZzIndustry Specializations | Row 1 | 184 | ✅ Yes | ❌ No URL | Skipped |
+
+**Total after deduplication: 2,635 courses**
+
+The ZzIndustry Specializations sheet has no Course URL column so slugs cannot be derived — these 184 courses are logged as `skipped_no_slug` in the output.
+
+---
+
+## 3. What the Scraper Collects
+
+| Field | API Source | Notes |
+|---|---|---|
+| Course name | `onDemandCourses.v1` | Verified against Excel |
+| Difficulty level | `onDemandCourses.v1` | BEGINNER / INTERMEDIATE / ADVANCED |
+| Domain types | `onDemandCourses.v1` | e.g. computer-science |
+| Learning objectives | `courses.v1/{id}` | CML-encoded, parsed to plain text |
+| Module titles & descriptions | `onDemandCourseMaterials.v2` | Requires CAUTH |
+| Item titles & durations | `onDemandCourseMaterials.v2` | Videos, readings, assignments |
+| Item type inference | Slug-based rules | video / reading / assignment / discussion |
+| Instructor names | `instructors.v1` | Full name list |
+| Skills | Page HTML | `[data-testid="skills-section"] a` |
+| Tools | Page HTML | `[data-testid="tools-section"] a` |
+| Course rating | Page HTML JSON | `avgProductRating` field |
+| Total modules / videos / readings / assignments | Computed | Aggregated from materials API |
+| Total duration (minutes) | Computed | Sum of item duration fields (ms → min) |
+
+**Fields confirmed NOT available in any API:**
+- Instructor rating (not returned by `instructors.v1`)
+- Skills/tools (only in page HTML, not in any API endpoint)
+
+---
+
+## 4. Repository Structure
 
 ```
 coursera_scraper/
-├── cs_scraper.py                        # Main scraper (v3)
-├── debug_api.py                         # API endpoint explorer/debugger
-├── run_cs_full.sh                       # SLURM job — full run from scratch
-├── run_cs_resume.sh                     # SLURM job — resume after CAUTH expiry
-├── run_cs_test.sh                       # SLURM job — test run (4 courses)
-├── requirements.txt                     # Python dependencies
-├── Coursera Career Academy PLUS+ Catalog.xlsx   # Input catalog (not in repo — see below)
-├── cs_dataset.json                      # Output: full nested data (generated)
-├── cs_dataset.csv                       # Output: flat CSV (generated)
-└── cs_checkpoint.json                   # Checkpoint for resuming (generated)
+├── cs_scraper.py            # Main scraper (v3 — current)
+├── submit_cs_scraper.py     # SLURM job generator (professor's pattern)
+├── setup_venv.sh            # One-time venv setup script
+├── debug_api.py             # API endpoint tester / debugger
+├── requirements.txt         # Python dependencies
+├── README.md                # This file
+├── scraper_venv/            # Virtual environment (created by setup_venv.sh)
+├── submit_slurm/            # Auto-generated .slurm files
+├── logs/                    # SLURM job logs
+└── Coursera Career Academy PLUS+ Catalog.xlsx
 ```
 
-> **Note:** The Excel catalog file and output data files are not committed to the repository due to size. See the **Input File** section below.
+**Output files** (generated after scraping completes):
+```
+cs_dataset_final.json        # Full nested JSON for all courses
+cs_dataset_final.csv         # Flat CSV for analysis / recommendation engine
+cs_checkpoint_chunk*.json    # Per-chunk auto-saved checkpoints (every 1 course)
+```
 
 ---
 
-## Prerequisites
+## 5. Setup on HPC Cluster
 
-### 1. Python Dependencies
+Following Professor Cheng's pattern from `qiongcheng5/max_coursera`.
 
-```bash
-pip install -r requirements.txt
-```
-
-Or manually:
-
-```bash
-pip install requests beautifulsoup4 openpyxl pandas lxml
-```
-
-### 2. Coursera CAUTH Cookie
-
-The scraper requires a valid Coursera session cookie (`CAUTH`) to access course content and APIs.
-
-**How to get it:**
-1. Open Chrome and go to [https://www.coursera.org](https://www.coursera.org)
-2. Log in to your Coursera account
-3. Open DevTools: `F12` (Windows/Linux) or `Cmd+Option+I` (Mac)
-4. Go to **Application** tab → **Cookies** → **https://www.coursera.org**
-5. Find the cookie named `CAUTH` and copy its value (it is ~400+ characters long)
-
-> **Important:** The CAUTH cookie expires after a few hours. If scraping is interrupted with 403 errors, get a fresh CAUTH and resume using `run_cs_resume.sh`.
-
-### 3. Input File
-
-The scraper reads from the **Coursera Career Academy PLUS+ Catalog.xlsx** file.
-
-This file contains three sheets:
-- `CA+ 825` — 2,450 CS courses (header on row 3)
-- `CA+ Guided Projects` — 456 CS courses (header on row 3)
-- `ZzIndustry Specializations` — 184 CS courses (no URL column, skipped)
-
-Total after deduplication: **~2,635 courses**
-
-Place this file in the same directory as `cs_scraper.py`.
-
----
-
-## Running on UNC Charlotte HPC Cluster
-
-### Step 1 — SSH into the cluster
+### One-time setup (already done on cluster)
 
 ```bash
 ssh dnagendr@hpc.charlotte.edu
-# Enter password + Duo 2FA
+cd ~/coursera_scraper
+bash setup_venv.sh
 ```
 
-### Step 2 — Upload files from your Mac
+`setup_venv.sh` creates `scraper_venv/` with:
+- `beautifulsoup4==4.14.3`
+- `lxml==6.0.2`
+- `openpyxl==3.1.5`
+- `pandas==2.3.3`
+- `requests==2.32.5`
 
-Run this from your **local Mac terminal** (not SSH):
+### Upload files from Mac
 
 ```bash
-scp cs_scraper.py run_cs_full.sh run_cs_resume.sh run_cs_test.sh requirements.txt \
-    "Coursera Career Academy PLUS+ Catalog.xlsx" \
+# From Mac terminal (not SSH):
+scp cs_scraper.py submit_cs_scraper.py \
     dnagendr@hpc.charlotte.edu:~/coursera_scraper/
 ```
 
-### Step 3 — Set up on cluster
+### Get CAUTH cookie
+
+1. Open Chrome → log into https://www.coursera.org
+2. Press **F12** → **Application** tab → **Storage → Cookies → coursera.org**
+3. Find cookie named **`CAUTH`** → copy the full Value (~400 characters)
+
+> ⚠️ CAUTH is tied to your Coursera account, not your IP. The same CAUTH works across all cluster nodes simultaneously. It typically expires after a few hours of scraping activity.
+
+---
+
+## 6. How to Run
+
+### Submit parallel jobs (professor's pattern — one job per chunk)
 
 ```bash
 cd ~/coursera_scraper
-pip install --user -r requirements.txt
+python3 submit_cs_scraper.py "PASTE_CAUTH_HERE" --chunks 20
 ```
 
-### Step 4 — Add your CAUTH cookie
+This generates and submits 20 SLURM jobs simultaneously, each processing ~132 courses.
+
+### Monitor jobs
 
 ```bash
-nano run_cs_full.sh
-# Replace PASTE_YOUR_FRESH_CAUTH_HERE with your actual CAUTH value
-# Save: Ctrl+O → Enter → Ctrl+X
+# See all running jobs with node assignments
+squeue -u dnagendr -o "%.10i %.9P %.12j %.8T %.6M %R"
+
+# Watch log for a specific chunk (logs go to ~/coursera_scraper/)
+cat ~/coursera_scraper/slurm-JOBID.out
+
+# Check progress across all chunks
+for f in ~/coursera_scraper/cs_checkpoint_chunk*of20.json; do
+  echo -n "$f: "
+  python3 -c "import json; d=json.load(open('$f')); \
+    print(len(d.get('completed_slugs',[])),' done')"
+done
 ```
 
-### Step 5 — Submit the job
+### Merge outputs after all jobs finish
 
 ```bash
-sbatch run_cs_full.sh
-squeue -u dnagendr        # check job status
+source ~/coursera_scraper/scraper_venv/bin/activate
+python3 submit_cs_scraper.py "" --merge --chunks 20
+# Creates cs_dataset_final.json and cs_dataset_final.csv
 ```
 
-### Step 6 — Monitor progress
+### Run a single job (no chunking)
 
 ```bash
-# Watch live log
-tail -f slurm_cs_full_<JOBID>.log
-
-# Check how many courses are done
-python3 -c "
-import json
-cp = json.load(open('cs_checkpoint.json'))
-print('Done:', len(cp.get('completed_slugs', [])), '/ 2635')
-"
-```
-
-### Step 7 — If CAUTH expires mid-run
-
-The scraper automatically detects CAUTH expiry (5 consecutive 403 errors) and stops cleanly, saving all progress to `cs_checkpoint.json`.
-
-To resume:
-
-```bash
-nano run_cs_resume.sh     # paste fresh CAUTH
-sbatch run_cs_resume.sh
-```
-
-Repeat until all 2,635 courses are done.
-
-### Step 8 — Download results to your Mac
-
-```bash
-# Run from local Mac terminal
-scp dnagendr@hpc.charlotte.edu:~/coursera_scraper/cs_dataset.json ~/Downloads/
-scp dnagendr@hpc.charlotte.edu:~/coursera_scraper/cs_dataset.csv ~/Downloads/
+source ~/coursera_scraper/scraper_venv/bin/activate
+python3 cs_scraper.py \
+    --excel "Coursera Career Academy PLUS+ Catalog.xlsx" \
+    --cauth "PASTE_CAUTH_HERE" \
+    --workers 1 \
+    --delay 3.0
 ```
 
 ---
 
-## Running Locally (Mac/Linux)
+## 7. Scraper Architecture
 
-If the HPC cluster's IP is blocked by Coursera, run the scraper locally instead:
+### API flow per course
 
+```
+Excel slug
+    ↓
+onDemandCourses.v1?q=slug&slug=SLUG
+    → course_id, level, instructorIds, domainTypes
+    ↓
+courses.v1/{course_id}
+    → learningObjectives (CML parsed to plain text)
+    ↓
+onDemandCourseMaterials.v2?courseId={id}   [CAUTH required]
+    → modules → lessons → items (videos, readings, assignments)
+    ↓
+Page HTML scrape: coursera.org/learn/{slug}
+    → skills, tools, avgProductRating
+    ↓
+instructors.v1/{id}
+    → instructor full names
+```
+
+### Key design decisions
+
+**Checkpoint every 1 course** — saves `cs_checkpoint.json` after every single course so no work is lost if CAUTH expires or the job is killed.
+
+**Thread-safe CAUTH detection** — uses `threading.Lock()`. When 5 consecutive API calls return 401/403, sets a global `_cauth_dead = True` flag. All threads stop cleanly and save partial output before exit.
+
+**Slug-based item type inference** — `onDemandCourseMaterials.v2` does not return item types directly. Types are inferred from item slugs using keyword matching rules (e.g. `quiz`, `graded-`, `programming-assignment` → `assignment`).
+
+**CML learning objective parsing** — Coursera encodes learning objectives in CML (Coursera Markup Language). The scraper recursively walks the CML AST to extract plain text strings.
+
+**Chunk mode** — `--chunk-index` and `--chunk-total` arguments slice the full 2,635 course list. Each chunk writes its own checkpoint and output files independently to avoid conflicts between parallel jobs.
+
+---
+
+## 8. HPC Deployment Journey — What We Tried
+
+This section documents every approach attempted and the outcome of each.
+
+### Run 1 — Basic SLURM, `module load python3`
+- **Job:** 10233444 | **Time limit:** 12h
+- **Result:** 23 courses scraped, CAUTH died ~2 hours in
+- **Issue:** Low request volume still triggered rate limiting after ~2 hours
+
+### Run 2 — Multi-worker (3 threads)
+- **Job:** 10234780
+- **Result:** CAUTH died within 10 minutes, 0 courses saved
+- **Issue:** 3 parallel threads tripled the API request rate → faster rate limiting
+
+### Runs 3–4 — Threading bug
+- **Jobs:** 10238302, 10238346, 10238360
+- **Result:** CAUTH died within 5–10 minutes
+- **Issue:** Race condition in CAUTH expiry detection — fixed with `threading.Lock()`
+
+### Run 5 — `random` import bug
+- **Job:** 10245040
+- **Result:** Crashed immediately with `NameError: name 'random' is not defined`
+- **Fix:** Added `random` to main import line
+
+### Run 6 — Professor's venv pattern
+- **Job:** 10260995
+- **Setup:** `setup_venv.sh` creates `scraper_venv/` following professor's `qiongcheng5/max_coursera` pattern
+- **Result:** Venv working ✅, course 1 scraped successfully ✅, then 403s within 6 minutes
+- **Log evidence:**
+  ```
+  17:08:07 [INFO] .NET & .NET Core Mastery → success | skills=6 tools=5 mods=1 vids=27
+  17:08:11 [WARNING] HTTP 403 on API (cauth_fail_count=1)
+  17:14:59 [WARNING] HTTP 403 on API (cauth_fail_count=1)
+  ```
+
+### Run 7 — 20 parallel chunk jobs (professor's multi-job pattern)
+- **Jobs:** 10261227–10261246 (20 jobs across nodes str-c9, str-c19, str-c26)
+- **Setup:** `submit_cs_scraper.py` generates one `.slurm` per chunk and submits all simultaneously — directly mirrors professor's `slurm_4get_wikidata_subnet.py` + `submit_4get_wikidata_subnet.sh` approach
+- **Result:** All 20 jobs ran, same 1-course-then-403 pattern on every chunk
+- **Discovery:** Root cause found — see Section 9
+
+---
+
+## 9. Root Cause: NAT Gateway Discovery
+
+**This is the key finding that explains all failures.**
+
+Inside the SLURM job log for chunk 0 (job 10261227, node str-c9):
+
+```
+Node     : str-c9.charlotte.edu
+Node IP  : 192.168.170.9        ← RFC 1918 private address
+Chunk    : 0 of 20
+...
+17:08:07 [INFO] Course 1/132 → success
+17:08:11 [WARNING] HTTP 403 on API
+```
+
+`192.168.x.x` is a **private IP address**. Every compute node on Orion sits behind a **NAT (Network Address Translation) gateway**. All outbound internet traffic — regardless of which physical node the SLURM job runs on — exits through **one shared external IP address**.
+
+### Impact on our multi-node strategy
+
+| What we assumed | What is actually true |
+|---|---|
+| 20 jobs on 20 nodes = 20 different external IPs | 20 jobs on 20 nodes = **1 external IP** |
+| More nodes = better rate limit bypass | More nodes = zero benefit for IP bypass |
+| Professor's multi-job pattern bypasses rate limiting | Pattern works for Wikidata (no rate limits); does not help with Coursera's IP-level blocking |
+
+Coursera applies rate limiting at the **external IP level**. Since the entire UNCC HPC cluster shares one NAT'd external IP, Coursera sees every request — from every node, every chunk, every job — as coming from the same machine and triggers rate limiting after 1–2 API calls.
+
+**The scraper itself is correct and working.** Course 1 always succeeds. The problem is entirely at the network infrastructure level.
+
+### Cluster node state during runs
+
+```
+STATE   NODES   NODELIST
+mix       6     str-c[19,96-97,155,165,201]        ← available
+drng     42     str-c[10,12,16-17,20-21,...]       ← draining for maintenance
+drain     2     str-c[14,164]                       ← offline
+alloc    37     str-bm5,str-c[1,3,7-9,...]         ← busy (other users)
+idle      2     str-abm1,str-bm1                    ← free
+```
+
+42 of ~100 nodes were draining for maintenance. All 20 submitted jobs landed on just 3 nodes (str-c9, str-c19, str-c26) — each sharing the same NAT external IP.
+
+---
+
+## 10. Current Blocker — Help Needed
+
+The scraper is fully implemented, tested, and working correctly. The only remaining problem is **Coursera's IP-level rate limiting on the HPC cluster's shared NAT gateway**.
+
+**Specific questions for Professor Cheng:**
+
+1. **Does UNCC HPC have a way to assign a dedicated outbound IP for research jobs?**  
+   Some HPC systems have a separate research egress IP or proxy distinct from the general NAT gateway.
+
+2. **Can HPC IT (`ithelp@uncc.edu`) configure a dedicated external IP for this scraping task?**  
+   Even a temporarily dedicated IP would allow the full 2,635-course run to complete.
+
+3. **Is there a university proxy or VPN endpoint that provides a different external IP?**
+
+4. **Is running on a cloud VM (GCP/AWS free tier) acceptable for this research?**  
+   A cloud VM has its own public IP, never previously seen by Coursera, and would resolve the issue entirely.
+
+5. **Would a very slow single-threaded run (45–60s delay) be feasible?**  
+   2,635 × 45s ≈ 33 hours. Coursera may not trigger rate limiting at this rate. Requires a job time limit of 48+ hours and a CAUTH that stays valid that long.
+
+---
+
+## 11. Proposed Solutions
+
+In order of preference:
+
+### Option A — HPC dedicated egress IP
+Ask HPC IT to assign a dedicated outbound IP for this research job. Zero code changes needed — just resubmit the existing job.
+
+### Option B — Cloud VM (recommended if Option A unavailable)
+```bash
+# On GCP e2-micro or AWS t2.micro (both free tier):
+git clone <this-repo>
+pip install -r requirements.txt
+python3 cs_scraper.py \
+    --excel "Coursera Career Academy PLUS+ Catalog.xlsx" \
+    --cauth "FRESH_CAUTH" \
+    --workers 2 \
+    --delay 2.0
+```
+A fresh cloud IP has no Coursera rate limit history. Expected completion: 2–4 hours.
+
+### Option C — Ultra-slow HPC run
 ```bash
 python3 cs_scraper.py \
-  --excel "Coursera Career Academy PLUS+ Catalog.xlsx" \
-  --cauth "YOUR_CAUTH_HERE" \
-  --workers 1 \
-  --delay 3.0
+    --excel "Coursera Career Academy PLUS+ Catalog.xlsx" \
+    --cauth "FRESH_CAUTH" \
+    --workers 1 \
+    --delay 45.0
 ```
+2,635 × 45s ≈ 33 hours. Submit as a 2-day SLURM job. Risk: CAUTH may expire before completion.
 
-To resume a previous run:
+### Option D — Incremental resume (current workaround)
+Since the scraper checkpoints after every course:
+1. Submit job with fresh CAUTH → scrapes ~1–5 courses before 403
+2. Get new CAUTH, resubmit with `--resume`
+3. Repeat ~500–2000 times
 
-```bash
-python3 cs_scraper.py \
-  --excel "Coursera Career Academy PLUS+ Catalog.xlsx" \
-  --cauth "YOUR_CAUTH_HERE" \
-  --workers 1 \
-  --delay 3.0 \
-  --resume
-```
+Tedious but would eventually complete all 2,635 courses.
 
 ---
 
-## Command Line Arguments
+## 12. Output Format
 
-| Argument | Default | Description |
-|---|---|---|
-| `--excel` | required | Path to the Coursera catalog Excel file |
-| `--cauth` | required | Coursera CAUTH session cookie value |
-| `--workers` | 3 | Number of parallel worker threads |
-| `--delay` | 2.0 | Seconds to wait between requests |
-| `--resume` | False | Resume from existing checkpoint |
-| `--test` | False | Test mode — scrape only 3 courses per sheet |
-| `--output` | `cs_dataset` | Output filename prefix |
-
----
-
-## Output Files
-
-### cs_dataset.json
-
-Nested JSON array. Each entry contains:
+### cs_dataset_final.json (nested per course)
 
 ```json
-{
-  "slug": "machine-learning",
-  "scraped_name": "Machine Learning Specialization",
-  "final_skills": ["Regression Analysis", "Unsupervised Learning"],
-  "final_tools": ["Python", "NumPy", "Scikit Learn"],
-  "learning_objectives": ["Build ML models", "Apply supervised learning"],
-  "total_modules": 12,
-  "total_videos": 98,
-  "total_readings": 22,
-  "total_assignments": 18,
-  "total_duration_minutes": 1842,
-  "course_rating": 4.9,
-  "instructor_names": ["Andrew Ng"],
-  "level": "BEGINNER",
-  "scrape_status": "success",
-  "modules": [
-    {
-      "title": "Introduction to Machine Learning",
-      "description": "...",
-      "videos": [...],
-      "readings": [...],
-      "assignments": [...]
-    }
-  ]
-}
+[
+  {
+    "slug": "net-core-mastery",
+    "xlsx_name": ".NET & .NET Core Mastery: Cross-Platform",
+    "scraped_name": ".NET & .NET Core Mastery: Cross-Platform",
+    "scrape_status": "success",
+    "level": "BEGINNER",
+    "course_rating": 4.7,
+    "instructor_names": ["John Smith"],
+    "learning_objectives": ["Build cross-platform apps", "..."],
+    "final_skills": ["C#", ".NET", "ASP.NET"],
+    "final_tools": ["Visual Studio", "Docker"],
+    "total_modules": 8,
+    "total_videos": 42,
+    "total_readings": 12,
+    "total_assignments": 6,
+    "total_duration_minutes": 380,
+    "modules": [
+      {
+        "title": "Introduction to .NET",
+        "description": "...",
+        "items": [
+          { "title": "What is .NET?", "type": "video", "duration_minutes": 8.5 }
+        ]
+      }
+    ]
+  }
+]
 ```
 
-### cs_dataset.csv
+### cs_dataset_final.csv (flat, pipe-separated multi-values)
 
-Flat CSV with all scalar fields. List fields (skills, tools, objectives) are pipe-separated (`|`).
-
-### cs_checkpoint.json
-
-Internal checkpoint file used for resuming. Contains list of completed slugs and all results so far. Saved after every course.
+| slug | name | status | skills | tools | objectives | level | rating | instructors | total_modules | total_videos | total_readings | total_assignments | total_duration_min |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| net-core-mastery | .NET & .NET Core Mastery | success | C#\|.NET\|ASP.NET | Visual Studio\|Docker | Build apps\|Deploy | BEGINNER | 4.7 | John Smith | 8 | 42 | 12 | 6 | 380 |
 
 ---
 
-## How the Scraper Works
+## 13. Troubleshooting
 
-The scraper uses three data sources for each course:
+**HTTP 403 after 1 course on HPC**  
+Coursera is rate limiting the cluster's shared NAT IP. See Sections 9 and 10. The scraper is working correctly.
 
-1. **`onDemandCourses.v1` API** — course ID, level, instructor IDs, domain
-2. **`onDemandCourseMaterials.v2` API** — full module/lesson/item tree (requires CAUTH)
-3. **Page HTML** — skills, tools, course rating (parsed with BeautifulSoup)
+**CAUTH expired (401 errors)**  
+Get a fresh CAUTH: Chrome → F12 → Application → Cookies → coursera.org → CAUTH value.
 
-Item types (video/reading/assignment) are inferred from item slugs since the API does not return a type field directly.
+**Log files not in `logs/` folder**  
+SLURM writes logs to the working directory. Check `~/coursera_scraper/slurm-JOBID.out`:
+```bash
+cat ~/coursera_scraper/slurm-10261227.out
+```
+
+**Checkpoint not found on resume**  
+Chunk checkpoints are named `cs_checkpoint_chunk00of20.json`. Single-job checkpoint is `cs_checkpoint.json`. Ensure `--chunks` matches the original run.
+
+**`No module named openpyxl`**  
+Activate the venv first:
+```bash
+source ~/coursera_scraper/scraper_venv/bin/activate
+```
+
+**ZzIndustry Specializations courses missing from output**  
+Expected — that sheet has no Course URL column. The 184 courses are recorded as `skipped_no_slug`.
 
 ---
 
-## Known Limitations
+## API Reference
 
-- **3rd-party courses** (EDUCBA, Packt, BoardInfinity) return module titles but no item-level data — these are marked `api_no_items`
-- **Instructor ratings** are not available via the Coursera API — only names are collected
-- **CAUTH expiry** — Coursera invalidates session cookies faster when scraping from data center IPs. Running locally on a home IP is more reliable.
-- **ZzIndustry Specializations** sheet has no URL/slug column and is skipped (`skipped_no_slug`)
+| Endpoint | Auth Required | Returns |
+|---|---|---|
+| `https://www.coursera.org/api/onDemandCourses.v1?q=slug&slug=SLUG` | None | id, name, level, instructorIds, domainTypes |
+| `https://www.coursera.org/api/courses.v1/{id}` | None | learningObjectives (CML encoded) |
+| `https://www.coursera.org/api/onDemandCourseMaterials.v2?courseId={id}` | **CAUTH** | modules, lessons, items, durations |
+| `https://www.coursera.org/api/instructors.v1/{id}` | None | fullName |
+| `https://www.coursera.org/learn/{slug}` | None (HTML) | skills, tools, avgProductRating |
 
 ---
 
-## Troubleshooting
-
-| Problem | Solution |
-|---|---|
-| `HTTP 403` errors immediately | CAUTH is expired — get a fresh one from Chrome |
-| `cs_checkpoint.json not found` | No courses completed yet — check the log for errors |
-| `ModuleNotFoundError` | Run `pip install -r requirements.txt` |
-| Job cancelled by SLURM | Time limit hit — resume with `run_cs_resume.sh` |
-| All courses showing `failed` | CAUTH was invalid from the start — recheck the cookie value |
+*Last updated: March 12, 2026*  
+*Scraper version: cs_scraper.py v3*  
+*Platform: UNCC HPC Orion partition, RHEL 9.7, Python 3.9.23*

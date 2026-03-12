@@ -1082,9 +1082,12 @@ def load_checkpoint():
             return json.load(f)
     return {"completed_slugs":[], "results":[]}
 
+_chunk_suffix = ""   # set in main() when chunk mode active
+
 def save_checkpoint(completed_slugs, results, lock):
     with lock:
         with open(CHECKPOINT_FILE,"w",encoding="utf-8") as f:
+            cp_file = f"cs_checkpoint{_chunk_suffix}.json"
             json.dump({"completed_slugs": completed_slugs, "results": results},
                       f, ensure_ascii=False, default=str)
         log.info("Checkpoint saved — %d done", len(completed_slugs))
@@ -1163,6 +1166,10 @@ def main():
     parser.add_argument("--delay",   type=float, default=1.5)
     parser.add_argument("--limit",   type=int,   default=None)
     parser.add_argument("--resume",  action="store_true")
+    parser.add_argument("--chunk-index", type=int, default=None,
+                        help="Which chunk to process (0-based)")
+    parser.add_argument("--chunk-total", type=int, default=None,
+                        help="Total number of chunks")
     parser.add_argument("--test",    action="store_true",
                         help="Test mode: 3 courses per sheet")
     args = parser.parse_args()
@@ -1184,6 +1191,17 @@ def main():
     log.info("="*60)
 
     all_courses = load_cs_courses(args.excel, limit=args.limit)
+
+    # ── Chunk mode: each job processes a slice of courses ──────────────
+    chunk_suffix = ""
+    if args.chunk_index is not None and args.chunk_total is not None:
+        ci, ct = args.chunk_index, args.chunk_total
+        chunk_size = (len(all_courses) + ct - 1) // ct
+        all_courses = all_courses[ci * chunk_size : (ci + 1) * chunk_size]
+        chunk_suffix = f"_chunk{ci:02d}of{ct:02d}"
+        log.info("Chunk %d/%d: processing %d courses", ci, ct, len(all_courses))
+        global _chunk_suffix
+        _chunk_suffix = chunk_suffix
     if not all_courses:
         log.error("No CS courses found."); sys.exit(1)
 
