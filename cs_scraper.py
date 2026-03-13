@@ -19,12 +19,28 @@ import openpyxl
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--excel",   required=True)
+parser.add_argument("--cauth",   default="")
+parser.add_argument("--workers", type=int,   default=5)
+parser.add_argument("--delay",   type=float, default=1.5)
+parser.add_argument("--limit",   type=int,   default=None)
+parser.add_argument("--resume",  action="store_true")
+parser.add_argument("--chunk-index", type=int, default=None,
+                    help="Which chunk to process (0-based)")
+parser.add_argument("--chunk-total", type=int, default=None,
+                    help="Total number of chunks")
+parser.add_argument("--test",    action="store_true",
+                    help="Test mode: 3 courses per sheet")
+args = parser.parse_args()
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("cs_scraper.log"),
+        logging.FileHandler(f"cs_scraper_{args.chunk_index}.log"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -32,9 +48,9 @@ log = logging.getLogger(__name__)
 
 BASE             = "https://www.coursera.org/api"
 CS_DOMAIN        = "Computer Science"
-CHECKPOINT_FILE  = "cs_checkpoint.json"
-OUTPUT_JSON      = "cs_dataset.json"
-OUTPUT_CSV       = "cs_dataset.csv"
+CHECKPOINT_FILE  = f"results/cs_checkpoint_{args.chunk_index}.json"
+OUTPUT_JSON      = f"results/cs_dataset_{args.chunk_index}.json"
+OUTPUT_CSV       = f"results/cs_dataset_{args.chunk_index}.csv"
 CHECKPOINT_EVERY = 1
 
 # CAUTH expiry tracking — thread-safe
@@ -546,6 +562,72 @@ def fetch_metadata(session, slug):
         "_partner_ids":        el.get("partnerIds",[]),
     }
 
+def fetch_metadata_from_html(session, slug):
+    """
+    Fallback metadata extraction from __NEXT_DATA__ JSON embedded in the page HTML.
+    Used when onDemandCourses.v1 API returns no elements (newer/3rd-party courses).
+    Extracts: course_id, name, description, level, languages, instructor/partner IDs.
+    """
+    html = page_get(session, "https://www.coursera.org/learn/" + slug)
+    if not html:
+        return {}
+    nd_match = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+        html, re.S
+    )
+    if not nd_match:
+        return {}
+    try:
+        nd = json.loads(nd_match.group(1))
+    except Exception:
+        return {}
+
+    # course_id: look for the xdp courseId or onDemandCourseId
+    course_id = (
+        deep_find(nd, ["courseId", "onDemandCourseId", "id"]) or ""
+    )
+    name = (
+        deep_find(nd, ["courseName", "name", "title"]) or ""
+    )
+    description = (
+        deep_find(nd, ["courseDescription", "description", "about"]) or ""
+    )
+    level = deep_find(nd, ["difficultyLevel", "level", "courseLevel"]) or ""
+    if isinstance(level, str):
+        level = level.upper()
+
+    soup = BeautifulSoup(html, "html.parser")
+    # Instructor IDs: Coursera embeds them as data attributes or in JSON
+    instructor_ids = flatten_str_list(deep_find(nd, ["instructorIds", "instructors"]))
+    partner_ids    = flatten_str_list(deep_find(nd, ["partnerIds", "partners"]))
+
+    if not name:
+        # Last resort: og:title or <title> tag
+        og = soup.find("meta", property="og:title")
+        name = og["content"].strip() if og and og.get("content") else ""
+        if not name:
+            t = soup.find("title")
+            if t:
+                name = re.sub(r"\s*[\|–-].*$", "", t.get_text(strip=True))
+
+    if not description:
+        og_desc = soup.find("meta", property="og:description")
+        description = og_desc["content"].strip() if og_desc and og_desc.get("content") else ""
+
+    log.info("HTML metadata fallback for %s: id=%s name=%s", slug, course_id, name[:40])
+    return {
+        "course_id":           str(course_id),
+        "scraped_name":        str(name),
+        "tagline":             "",
+        "scraped_description": str(description).strip(),
+        "level":               str(level),
+        "primary_languages":   [],
+        "workload":            "",
+        "_instructor_ids":     instructor_ids,
+        "_partner_ids":        partner_ids,
+        "_meta_source":        "html_fallback",
+    }
+
 def fetch_enriched(session, course_id):
     if not course_id: return {}
     data = safe_get(session, BASE + "/courses.v1/" + course_id, {
@@ -981,7 +1063,11 @@ def scrape_course(course, cauth):
     try:
         meta = fetch_metadata(session, slug)
         if not meta:
-            return {**course, "scrape_status": "failed", "fail_reason": "metadata_failed"}
+            # API returned no elements — try extracting from page HTML (__NEXT_DATA__)
+            log.warning("onDemandCourses.v1 empty for %s — trying HTML fallback", slug)
+            meta = fetch_metadata_from_html(session, slug)
+            if not meta:
+                return {**course, "scrape_status": "failed", "fail_reason": "metadata_failed"}
         course_id = meta.get("course_id","")
 
         em          = fetch_enriched(session, course_id)
@@ -1082,9 +1168,12 @@ def load_checkpoint():
             return json.load(f)
     return {"completed_slugs":[], "results":[]}
 
+_chunk_suffix = ""   # set in main() when chunk mode active
+
 def save_checkpoint(completed_slugs, results, lock):
     with lock:
         with open(CHECKPOINT_FILE,"w",encoding="utf-8") as f:
+            cp_file = f"cs_checkpoint{_chunk_suffix}.json"
             json.dump({"completed_slugs": completed_slugs, "results": results},
                       f, ensure_ascii=False, default=str)
         log.info("Checkpoint saved — %d done", len(completed_slugs))
@@ -1156,16 +1245,20 @@ def save_outputs(results):
 
 # ── MAIN ──────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--excel",   required=True)
-    parser.add_argument("--cauth",   default="")
-    parser.add_argument("--workers", type=int,   default=5)
-    parser.add_argument("--delay",   type=float, default=1.5)
-    parser.add_argument("--limit",   type=int,   default=None)
-    parser.add_argument("--resume",  action="store_true")
-    parser.add_argument("--test",    action="store_true",
-                        help="Test mode: 3 courses per sheet")
-    args = parser.parse_args()
+#    parser = argparse.ArgumentParser()
+#    parser.add_argument("--excel",   required=True)
+#    parser.add_argument("--cauth",   default="")
+#    parser.add_argument("--workers", type=int,   default=5)
+#    parser.add_argument("--delay",   type=float, default=1.5)
+#    parser.add_argument("--limit",   type=int,   default=None)
+#    parser.add_argument("--resume",  action="store_true")
+#    parser.add_argument("--chunk-index", type=int, default=None,
+#                        help="Which chunk to process (0-based)")
+#    parser.add_argument("--chunk-total", type=int, default=None,
+#                        help="Total number of chunks")
+#    parser.add_argument("--test",    action="store_true",
+#                        help="Test mode: 3 courses per sheet")
+#    args = parser.parse_args()
 
     global CHECKPOINT_FILE, OUTPUT_JSON, OUTPUT_CSV
     if args.test:
@@ -1184,6 +1277,22 @@ def main():
     log.info("="*60)
 
     all_courses = load_cs_courses(args.excel, limit=args.limit)
+
+    # ── Chunk mode: each job processes a slice of courses ──────────────
+    chunk_suffix = ""
+    if args.chunk_index is not None and args.chunk_total is not None:
+        ci, ct = args.chunk_index, args.chunk_total
+        chunk_size = (len(all_courses) + ct - 1) // ct
+        start_index = ci * chunk_size
+        end_index = (ci + 1) * chunk_size 
+        if end_index > len(all_courses):
+            end_index = len(all_courses) 
+        print(chunk_size, start_index, end_index-1)
+        all_courses = all_courses[start_index: end_index]  #(ci + 1) * chunk_size]
+        chunk_suffix = f"_chunk{ci:02d}of{ct:02d}"
+        log.info("Chunk %d/%d: processing %d courses", ci, ct, len(all_courses))
+        global _chunk_suffix
+        _chunk_suffix = chunk_suffix
     if not all_courses:
         log.error("No CS courses found."); sys.exit(1)
 
@@ -1206,55 +1315,35 @@ def main():
     since_checkpoint = [0]
     start_time       = time.time()
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(scrape_course, c, args.cauth): c for c in pending}
-        for future in as_completed(futures):
-            # Stop submitting work if CAUTH died
-            if _cauth_dead:
-                log.error("CAUTH dead — saving checkpoint and stopping.")
-                save_checkpoint(list(completed_slugs), results, lock)
-                # Also save partial output so data isn't lost
-                if results:
-                    save_outputs(results)
-                    log.info("Partial output saved: %d courses", len(results))
-                for f in futures:
-                    f.cancel()
-                break
-
-            course = futures[future]
-            try:
-                result = future.result()
-            except Exception as e:
-                result = {**course, "scrape_status": "failed", "fail_reason": str(e)}
-
-            with lock:
-                results.append(result)
-                slug = course.get("slug") or ""
-                if slug: completed_slugs.add(slug)
-                done_count[0]       += 1
-                since_checkpoint[0] += 1
-                elapsed    = time.time() - start_time
-                per_course = elapsed / done_count[0] if done_count[0] else 0
-                remaining  = (total - done_count[0]) * per_course
-                log.info(
-                    "[%d/%d] %-40s | %s | skills=%d tools=%d obj=%d "
-                    "mods=%d vids=%d reads=%d assigns=%d | src=%s | ETA %dm",
-                    done_count[0], total,
-                    str(result.get("scraped_name") or result.get("xlsx_name",""))[:40],
-                    result.get("scrape_status","?"),
-                    len(result.get("final_skills",[])),
-                    len(result.get("final_tools",[])),
-                    len(result.get("learning_objectives",[])),
-                    result.get("total_modules",0),
-                    result.get("total_videos",0),
-                    result.get("total_readings",0),
-                    result.get("total_assignments",0),
-                    result.get("modules_source","?"),
-                    int(remaining/60),
-                )
-                if since_checkpoint[0] >= CHECKPOINT_EVERY:
-                    save_checkpoint(list(completed_slugs), results, lock)
-                    since_checkpoint[0] = 0
+    for c in pending:
+        result = scrape_course(c, args.cauth)
+        results.append(result)
+        #slug = c.get("slug") or ""
+        #if slug: completed_slugs.add(slug)
+        done_count[0] += 1
+        since_checkpoint[0] += 1
+        elapsed    = time.time() - start_time
+        per_course = elapsed / done_count[0] if done_count[0] else 0
+        remaining  = (total - done_count[0]) * per_course
+        log.info(
+            "[%d/%d] %-40s | %s | skills=%d tools=%d obj=%d "
+            "mods=%d vids=%d reads=%d assigns=%d | src=%s | ETA %dm",
+            done_count[0], total,
+            str(result.get("scraped_name") or result.get("xlsx_name",""))[:40],
+            result.get("scrape_status","?"),
+            len(result.get("final_skills",[])),
+            len(result.get("final_tools",[])),
+            len(result.get("learning_objectives",[])),
+            result.get("total_modules",0),
+            result.get("total_videos",0),
+            result.get("total_readings",0),
+            result.get("total_assignments",0),
+            result.get("modules_source","?"),
+            int(remaining/60),
+        )
+        if since_checkpoint[0] >= CHECKPOINT_EVERY:
+            save_checkpoint(list(completed_slugs), results, lock)
+            since_checkpoint[0] = 0
 
     log.info("="*60)
     save_checkpoint(list(completed_slugs), results, lock)
